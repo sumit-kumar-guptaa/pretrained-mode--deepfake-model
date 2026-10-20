@@ -1,0 +1,477 @@
+"""
+Real rPPG dataset for the quantum layer (no synthetic data).
+
+Reads the labelled feature table produced by the rPPG pipeline
+(WORKING/output/rppg/dataset_features.csv), converts its labels onto the quantum
+convention (CSV: 1 = deepfake, 0 = real; quantum: LABEL_REAL = 1,
+LABEL_FAKE = 0), and stores a subject-grouped train/val/test split as
+data.npz for QAOA selection, VQC training, and evaluation.
+
+Only DFDC dataset is supported. Subject grouping: each clip is treated as 
+an individual group ("clip:<path>") - a documented limitation (DFDC subject-level 
+separation is unrecoverable from filenames). The split is seeded and balanced 
+per class, and a leakage assertion aborts the build if any group key appears 
+in more than one split.
+"""
+
+import csv
+import json
+
+import numpy as np
+
+from quantum.config import (
+    DataConfig,
+    FEATURE_NAMES,  # alias for RPPG_FEATURE_NAMES
+    RPPG_FEATURE_NAMES,
+    VISUAL_FEATURE_NAMES,
+    FUSED_FEATURE_NAMES,
+    FEATURE_SET_CONFIGS,
+    LABEL_FAKE,
+    LABEL_REAL,
+    OUTPUT_DIR,
+)
+
+RPPG_LABEL_FAKE = 1  # rPPG CSV convention: 1 = deepfake, 0 = real
+# LABEL_REAL / LABEL_FAKE are imported from quantum.config (single source).
+
+SPLITS = ("train", "val", "test")
+
+# Single source of feature-set names lives in quantum.config; re-exported
+# here for the data-loading call sites and tests.
+FEATURE_SETS = FEATURE_SET_CONFIGS
+
+def csv_to_quantum_label(csv_label):
+    """Convert rPPG CSV label to quantum convention.
+
+    rPPG CSV: 1 = deepfake, 0 = real
+    Quantum:  LABEL_REAL = 1, LABEL_FAKE = 0
+
+    The conversion is ``y = 1 - csv_label``:
+        - CSV 1 (deepfake)  -> quantum 0 (LABEL_FAKE)
+        - CSV 0 (real)      -> quantum 1 (LABEL_REAL)
+
+    Args:
+        csv_label: int, either 0 or 1 from the rPPG feature CSV
+
+    Returns:
+        int: quantum convention label (0 = fake, 1 = real)
+    """
+    if csv_label not in (0, 1):
+        raise ValueError(f"CSV label must be 0 or 1, got {csv_label}")
+    return 1 - csv_label
+
+
+def quantum_to_display_label(label):
+    """Convert quantum label to display/verdict label.
+
+    Quantum: LABEL_REAL = 1, LABEL_FAKE = 0
+    Display:   REAL, FAKE
+
+    Args:
+        label: int, quantum convention label (0 = fake, 1 = real)
+
+    Returns:
+        str: display label ('REAL' or 'FAKE')
+    """
+    if label == LABEL_REAL:
+        return "REAL"
+    elif label == LABEL_FAKE:
+        return "FAKE"
+    else:
+        raise ValueError(f"Invalid quantum label: {label}")
+
+
+GROUP_COLUMNS = (
+    "subject_id",
+    "identity_id",
+    "original_video_id",
+    "source_video_id",
+    "source_id",
+    "group_id",
+    "video_sha256",
+    "content_sha256",
+    "file_sha256",
+    "sha256",
+)
+
+
+def _normalise_group_value(value):
+    """Return a stable, non-empty group identifier or None."""
+    if value is None:
+        return None
+    value = str(value).replace("\\", "/").strip().lower()
+    return value or None
+
+
+def _infer_subject_key(row):
+    """Derive the strongest available correlation group from a feature row.
+
+    Dataset extractors may provide subject/source/original identifiers. Those
+    identifiers are authoritative. For DFDC rows without such metadata, the
+    clip path is the only recoverable key and is explicitly marked as a
+    clip-level fallback in the persisted manifest.
+    """
+    for column in GROUP_COLUMNS:
+        value = _normalise_group_value(row.get(column))
+        if value is not None:
+            return f"{column}:{value}"
+    path = _normalise_group_value(row.get("video_path"))
+    if path is None:
+        raise ValueError("Each feature row must provide video_path or a group identifier")
+    return "clip:" + path
+
+
+def _infer_split_key(row):
+    """Official dataset split when the source layout declares one.
+
+    DFDC has no official train/val/test folder structure, so returns None
+    and falls back to the seeded grouped random split.
+    """
+    return None
+
+
+def _load_feature_rows(csv_file, feature_names, cfg=None):
+    """Load a feature table with the specified feature names.
+
+    Returns X (n x len(feature_names), feature_names order), y (quantum convention:
+    1 = real, 0 = fake), subject groups, video paths, and a dict of
+    filtering stats. When cfg.filter_implausible is set, rows with a
+    heart rate outside [hr_min, hr_max] or with non-finite feature
+    values are dropped (plausibility hygiene for KYC signals).
+
+    If some feature_names are missing from the CSV, they are filled with NaN.
+    """
+    if not csv_file.exists():
+        raise FileNotFoundError(
+            f"Feature file not found at {csv_file}."
+        )
+    with open(csv_file, newline="", encoding="utf-8") as fh:
+        rows = list(csv.DictReader(fh))
+    if not rows:
+        raise ValueError(f"No labelled samples found in {csv_file}")
+
+    # Determine which feature names are actually present in the CSV
+    available_names = [name for name in feature_names if name in rows[0]]
+    missing = [name for name in feature_names if name not in rows[0]]
+    if missing:
+        print(f"Warning: {csv_file} is missing columns (will be filled with NaN): {missing}")
+
+    filter_stats = {"total": len(rows), "dropped_hr": 0, "dropped_invalid": 0}
+    keep = []
+    for row in rows:
+        try:
+            values = []
+            valid_values = []  # Values from columns that actually exist in CSV
+            for name in feature_names:
+                if name in row:
+                    val = float(row[name])
+                    values.append(val)
+                    valid_values.append(val)
+                else:
+                    values.append(float("nan"))  # Missing column -> NaN
+        except (TypeError, ValueError):
+            keep.append(None)
+            continue
+        # Only check for invalid values in columns that actually exist in the CSV
+        if not np.isfinite(valid_values).all():
+            filter_stats["dropped_invalid"] += 1
+            keep.append(None)
+            continue
+        # Only apply HR filter if heart_rate_bpm is in available names and has valid value
+        if "heart_rate_bpm" in available_names:
+            hr_idx = feature_names.index("heart_rate_bpm")
+            hr = values[hr_idx]
+            if np.isfinite(hr) and cfg is not None and cfg.filter_implausible and not (cfg.hr_min <= hr <= cfg.hr_max):
+                filter_stats["dropped_hr"] += 1
+                keep.append(None)
+                continue
+        keep.append(row)
+
+    kept_rows = [row for row in keep if row is not None]
+    filter_stats["kept"] = len(kept_rows)
+    if not kept_rows:
+        raise ValueError(f"No labelled samples survived filtering in {csv_file}")
+    paths_seen = set()
+    hashes_seen = {}
+    for row in kept_rows:
+        path = _normalise_group_value(row.get("video_path"))
+        if path is None:
+            raise ValueError("Every feature row must provide video_path")
+        if path in paths_seen:
+            raise ValueError(f"Duplicate video_path found: {path}")
+        paths_seen.add(path)
+        group = _infer_subject_key(row)
+        for column in ("video_sha256", "content_sha256", "file_sha256", "sha256"):
+            digest = _normalise_group_value(row.get(column))
+            if digest is not None:
+                previous = hashes_seen.setdefault(digest, group)
+                if previous != group:
+                    raise ValueError(
+                        f"Content hash {digest} maps to multiple groups: "
+                        f"{previous} and {group}"
+                    )
+
+    X = np.asarray(
+        [[float(row[name]) if name in row else float("nan") for name in feature_names] for row in kept_rows], dtype=np.float32
+    )
+    labels = np.asarray([int(round(float(row["label"]))) for row in kept_rows], dtype=np.int64)
+    if set(labels.tolist()) - {0, 1}:
+        raise ValueError("Labels must be 0 (real) or 1 (fake)")
+    y = np.where(labels == RPPG_LABEL_FAKE, LABEL_FAKE, LABEL_REAL).astype(np.int64)
+    groups = np.asarray([_infer_subject_key(row) for row in kept_rows], dtype=object)
+    paths = np.asarray([row["video_path"].strip() for row in kept_rows], dtype=object)
+    split_keys = np.asarray([_infer_split_key(row) for row in kept_rows], dtype=object)
+    return X, y, groups, paths, split_keys, filter_stats
+
+
+def _grouped_train_val_test_split(X, y, groups, paths, cfg):
+    """Deterministic subject-grouped train/val/test split, balanced per class.
+
+    Groups are assigned greedily to the split with the largest remaining
+    (normalized) per-class demand, so each split ends up with roughly
+    val_ratio / test_ratio of every class (train = remainder) while never
+    separating the samples of one subject. Seeded via cfg.seed.
+    """
+    n_classes = int(y.max()) + 1
+    per_class = [int((y == c).sum()) for c in range(n_classes)]
+    target = {s: [0] * n_classes for s in SPLITS}
+    for c in range(n_classes):
+        val_c = int(round(per_class[c] * cfg.val_ratio))
+        test_c = int(round(per_class[c] * cfg.test_ratio))
+        train_c = per_class[c] - val_c - test_c
+        if train_c < 0:
+            raise ValueError("Not enough samples per class for the requested ratios")
+        target["train"][c] = train_c
+        target["val"][c] = val_c
+        target["test"][c] = test_c
+
+    grouped = {}
+    for i, g in enumerate(groups):
+        grouped.setdefault(g, []).append(i)
+    paths = np.array(paths)  # enable numpy array indexing
+
+    rng = np.random.RandomState(cfg.seed)
+    mixed, single = [], {c: [] for c in range(n_classes)}
+    for idxs in grouped.values():
+        labels = set(y[idxs].tolist())
+        if len(labels) == 1:
+            single[labels.pop()].append(idxs)
+        else:
+            mixed.append(idxs)
+
+    assigned = {s: [0] * n_classes for s in SPLITS}
+    splits = {s: [] for s in SPLITS}
+
+    def remaining(s, classes):
+        return sum(target[s][c] - assigned[s][c] for c in classes)
+
+    def place(idxs):
+        classes = set(y[idxs].tolist())
+        scores = {}
+        for s in SPLITS:
+            need = remaining(s, classes)
+            if need > 0:
+                scores[s] = need / max(1.0, sum(target[s]))
+        if scores:
+            s = max(scores, key=scores.get)
+        else:
+            s = min(SPLITS, key=lambda s: sum(assigned[s]))
+        splits[s].append(idxs)
+        for c in classes:
+            assigned[s][c] += int((y[idxs] == c).sum())
+
+    rng.shuffle(mixed)
+    for idxs in mixed:
+        place(idxs)
+    for c in range(n_classes):
+        rng.shuffle(single[c])
+        for idxs in single[c]:
+            place(idxs)
+
+    data = {}
+    for s in SPLITS:
+        idx = np.concatenate(splits[s]) if splits[s] else np.array([], dtype=np.int64)
+        data[f"X_{s}"] = X[idx]
+        data[f"y_{s}"] = y[idx]
+        data[f"groups_{s}"] = groups[idx]
+        data[f"paths_{s}"] = paths[idx]
+    return data
+
+
+def _assert_no_group_leakage(split):
+    """Fail loudly if any subject group appears in more than one split.
+
+    Subject grouping (see _infer_subject_key) exists so a person's real
+    and fake takes stay in the same split; if a group key ever straddles
+    train/val/test that is data leakage and the build must abort.
+    """
+    seen = {}
+    for s in SPLITS:
+        for g in split[f"groups_{s}"]:
+            g = str(g)
+            if g in seen and seen[g] != s:
+                raise AssertionError(
+                    f"Subject-group leakage: group '{g}' appears in both "
+                    f"'{seen[g]}' and '{s}' splits. Fix _infer_subject_key."
+                )
+            seen[g] = s
+
+
+def verify_split_integrity(manifest_path):
+    """Validate persisted split disjointness and duplicate provenance."""
+    with open(manifest_path, encoding="utf-8") as fh:
+        manifest = json.load(fh)
+    rows = manifest.get("rows", {})
+    by_split = {s: set() for s in SPLITS}
+    for path, item in rows.items():
+        split = item.get("split")
+        group = item.get("group")
+        if split not in SPLITS or not group:
+            raise ValueError(f"Invalid split manifest row for {path}")
+        by_split[split].add(str(group))
+    for left in SPLITS:
+        for right in SPLITS:
+            if left < right:
+                overlap = by_split[left] & by_split[right]
+                if overlap:
+                    raise AssertionError(
+                        f"Group leakage between {left} and {right}: {sorted(overlap)}"
+                    )
+    return True
+
+
+def _write_split_manifest(split, cfg):
+    """Record path -> (split, group) so any future split can be reproduced.
+
+    The manifest lives next to data.npz (gitignored) and is consumed by
+    the baseline harness in Phase 1.
+    """
+    manifest = {
+        "seed": cfg.seed,
+        "val_ratio": cfg.val_ratio,
+        "test_ratio": cfg.test_ratio,
+        "filter_implausible": cfg.filter_implausible,
+        "rows": {},
+    }
+    for s in SPLITS:
+        for p, g in zip(split[f"paths_{s}"], split[f"groups_{s}"]):
+            manifest["rows"][str(p)] = {"split": s, "group": str(g)}
+    out = OUTPUT_DIR / "split_manifest.json"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    with open(out, "w") as fh:
+        json.dump(manifest, fh, indent=2)
+    return out
+
+
+def build_dataset(cfg=None, feature_set: str = "fused", csv_file=None):
+    """Build data.npz from a feature table.
+
+    Only fused mode (rPPG + Visual) is supported.
+
+    Args:
+        cfg: DataConfig instance
+        feature_set: Must be "fused"
+        csv_file: Optional path to fused features CSV file
+    """
+    if feature_set != "fused":
+        raise ValueError(f"Only 'fused' feature set is supported, got: {feature_set}")
+    
+    cfg = cfg or DataConfig()
+    feature_names = FEATURE_SETS.get(feature_set, FUSED_FEATURE_NAMES)
+
+    # Determine CSV file - must provide fused CSV
+    if csv_file is None:
+        csv_file = cfg.csv_file.parent.parent / "visual" / "fused_features.csv"
+
+    X, y, groups, paths, split_keys, stats = _load_feature_rows(csv_file, feature_names, cfg)
+
+    if cfg.filter_implausible and "heart_rate_bpm" in feature_names:
+        print(
+            f"  Plausibility filter: {stats['kept']}/{stats['total']} kept "
+            f"(HR out of [{cfg.hr_min}, {cfg.hr_max}]: {stats['dropped_hr']}, "
+            f"non-finite features: {stats['dropped_invalid']})"
+        )
+    elif "heart_rate_bpm" not in feature_names:
+        print(
+            f"  Filtering: {stats['kept']}/{stats['total']} kept "
+            f"(non-finite features: {stats['dropped_invalid']}) "
+            f"(HR filter skipped for feature_set={feature_set})"
+        )
+
+    # Always use grouped random split for DFDC (no official splits)
+    split = _grouped_train_val_test_split(X, y, groups, paths, cfg)
+    _assert_no_group_leakage(split)
+    normalised_paths = [_normalise_group_value(path) for path in paths.tolist()]
+    if len(set(normalised_paths)) != len(normalised_paths):
+        raise ValueError("Duplicate video_path values found; refusing to build a split")
+
+    # Save manifest with feature set info
+    manifest = {
+        "seed": cfg.seed,
+        "val_ratio": cfg.val_ratio,
+        "test_ratio": cfg.test_ratio,
+        "filter_implausible": cfg.filter_implausible,
+        "feature_set": feature_set,
+        "feature_names": feature_names,
+        "grouping": {
+            "strategy": "metadata-first-grouped-split",
+            "columns": list(GROUP_COLUMNS),
+            "fallback": "clip:path when no correlation metadata is available",
+        },
+        "rows": {},
+    }
+    for s in SPLITS:
+        for p, g in zip(split[f"paths_{s}"], split[f"groups_{s}"]):
+            manifest["rows"][str(p)] = {"split": s, "group": str(g)}
+    manifest_file = OUTPUT_DIR / f"split_manifest_{feature_set}.json"
+    manifest_file.parent.mkdir(parents=True, exist_ok=True)
+    with open(manifest_file, "w") as fh:
+        json.dump(manifest, fh, indent=2)
+    print(f"  Split manifest written: {manifest_file}")
+
+    # Save data file with feature set suffix
+    data_file = OUTPUT_DIR / f"data_{feature_set}.npz"
+    data_file.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(
+        data_file,
+        X_train=split["X_train"],
+        y_train=split["y_train"],
+        X_val=split["X_val"],
+        y_val=split["y_val"],
+        X_test=split["X_test"],
+        y_test=split["y_test"],
+        groups_train=np.asarray(split["groups_train"], dtype=str),
+        groups_val=np.asarray(split["groups_val"], dtype=str),
+        groups_test=np.asarray(split["groups_test"], dtype=str),
+        paths_train=np.asarray(split["paths_train"], dtype=str),
+        paths_val=np.asarray(split["paths_val"], dtype=str),
+        paths_test=np.asarray(split["paths_test"], dtype=str),
+        feature_names=np.array(feature_names, dtype=object),
+    )
+    print(f"  Built subject-grouped split from {len(X)} samples (feature_set={feature_set}):")
+    for s in SPLITS:
+        ys = split[f"y_{s}"]
+        n_groups = len(set(split[f"groups_{s}"].tolist()))
+        print(
+            f"    {s}: {len(ys)} samples "
+            f"({int((ys == LABEL_REAL).sum())} real / {int((ys == LABEL_FAKE).sum())} fake, "
+            f"{n_groups} subject groups)"
+        )
+    return load_dataset(data_file)
+
+
+def load_dataset(path=None):
+    """Load dataset from NPZ file."""
+    path = path or DataConfig().data_file
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Dataset not found at {path}. Build it first with: python -m quantum.pipeline --build-data"
+        )
+    data = np.load(path, allow_pickle=True)
+    return {
+        key: data[key]
+        for key in (
+            "X_train", "y_train", "X_val", "y_val", "X_test", "y_test",
+            "groups_train", "groups_val", "groups_test",
+        )
+    }
