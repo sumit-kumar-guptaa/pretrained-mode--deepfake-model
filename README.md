@@ -7,7 +7,8 @@
 Detection of deepfake videos for video KYC in financial systems using
 **rPPG (remote photoplethysmography)** as the physiological evidence layer,
 **visual features** (ResNet50 + handcrafted) as the complementary appearance layer,
-and **hybrid quantum-classical ML** as the final decision layer, designed for low-resolution videos.
+and **hybrid quantum-classical ML**, a **pretrained ViT**, or a **DeepfakeBench
+image detector** as the final decision layer, designed for low-resolution videos.
 
 ## Contents
 
@@ -33,17 +34,25 @@ Input KYC video
   → Stage 1: Frame sampling + quality filtering    (WORKING/frame/)
   → Stage 2: rPPG signal extraction + features     (WORKING/RPPG/)
   → Stage 3: Visual feature extraction             (WORKING/visual/)
-  → Stage 4: QAOA selection → hybrid VQC verdict   (WORKING/quantum/)
+  → Stage 4A: QAOA selection → hybrid VQC verdict  (WORKING/quantum/)   [default]
+  → Stage 4B: ViT frame encoder → optional rPPG fusion (WORKING/vit/) [alternative]
+  → Stage 4C: DeepfakeBench detector → optional rPPG fusion (WORKING/dfb_backend/) [alternative]
   → Decision: REAL / FAKE
 ```
 
 End-to-end orchestrator (`WORKING/run_pipeline.py`):
 
 ```text
-frames → rPPG → visual → quantum (fused) → verdict (REAL / FAKE)
+frames → rPPG → visual → quantum (fused) → verdict (REAL / FAKE)   [--backend quantum]
+frames → rPPG → ViT (frames + optional rPPG fusion) → verdict      [--backend vit]
+frames → rPPG → DeepfakeBench detector (+ optional fusion) → verdict [--backend dfb]
 ```
 
-> Only **fused mode** (rPPG + visual) is supported. No `rppg_only`, `visual_only`, or other feature set modes.
+> Quantum inference supports **fused mode** (rPPG + visual) only. The ViT backend
+> consumes accepted face frames and optionally the 20 rPPG features; its ViT-only
+> ablation disables rPPG. The DFB backend consumes accepted face frames, uses a
+> fine-tuned Xception checkpoint by default when present, and optionally fuses the
+> 20 rPPG features.
 > Only **DFDC dataset** is supported for training. No FaceForensics++ (FF++).
 
 ## Repository Layout
@@ -54,13 +63,17 @@ frames → rPPG → visual → quantum (fused) → verdict (REAL / FAKE)
 | `WORKING/frame/` | Stage 1 — frame sampling, YOLO face detection, quality filtering |
 | `WORKING/RPPG/` | Stage 2 — MediaPipe face ROIs → POS/CHROM pulse → 20 physiological features |
 | `WORKING/visual/` | Stage 3 — ResNet50 + handcrafted visual features from face crops (39 features) |
-| `WORKING/quantum/` | Stage 4 — QAOA feature selection → hybrid VQC → P(real) → verdict (run via `python -m quantum.pipeline`) |
-| `WORKING/run_pipeline.py` | End-to-end orchestrator: frames → rPPG → visual → quantum → verdict |
+| `WORKING/quantum/` | Stage 4A — QAOA feature selection → hybrid VQC → P(real) → verdict (run via `python -m quantum.pipeline`) |
+| `WORKING/vit/` | Stage 4B — pretrained ViT frame encoder + temporal head + optional rPPG fusion (run via `python -m vit.pipeline`) |
+| `WORKING/dfb_backend/` | Stage 4C — DeepfakeBench Xception/UCF/EfficientNet-B4 detector, optional DFDC fine-tuning and rPPG fusion |
+| `WORKING/run_pipeline.py` | End-to-end orchestrator with `--backend quantum` (default), `vit`, or `dfb` |
 | `WORKING/MAJ_OUTPUT_ROOT` | Default global regenerated-artifacts root (all `MAJ_OUTPUT_ROOT` dirs untracked); configurable via `MAJ_OUTPUT_ROOT` env var (defaults to `Scrape/output/`) |
 | `MAJ_OUTPUT_ROOT/frames/` | Stage 1: `frame_sequences/`, `frame_extraction_*.json(l)`, `docs/` |
 | `MAJ_OUTPUT_ROOT/rppg/` | Stage 2: `dataset_features.csv`, `rppg_classifier.pkl` + metadata, plots |
 | `MAJ_OUTPUT_ROOT/visual/` | Stage 3: `visual_features.csv`, `fused_features.csv` |
-| `MAJ_OUTPUT_ROOT/quantum/` | Stage 4: `data_fused.npz`, `qaoa_selection_fused.json`, `feature_scaler_fused.json`, `hybrid_vqc_fused.pt`, metrics, plots |
+| `MAJ_OUTPUT_ROOT/quantum/` | Stage 4A: `data_fused.npz`, `qaoa_selection_fused.json`, `feature_scaler_fused.json`, `hybrid_vqc_fused.pt`, metrics, plots |
+| `MAJ_OUTPUT_ROOT/vit/` | Stage 4B: `vit_model.pt` + JSON config, `vit_only.pt` ablation, metrics, ROC/confusion/calibration plots, comparison table |
+| `MAJ_OUTPUT_ROOT/dfb/` | Stage 4C: scores/metrics per detector, fine-tuned checkpoint + JSON, `fusion.json`, ROC/confusion/calibration plots |
 | `MAJ_OUTPUT_ROOT/pipeline/` | `run_pipeline.py` result JSON |
 | `frontend/` | Web UI: React + Vite frontend + stdlib-only API server (port 8000) |
 | `Docs/` | Project docs: RMTT semester report, key findings, remediation plan, problem analysis, bottleneck diagnosis |
@@ -77,6 +90,28 @@ frames → rPPG → visual → quantum (fused) → verdict (REAL / FAKE)
 | Decision Bins             | REAL / FAKE | —               | —                   |
 
 *Run `python -m quantum.pipeline --all` from `WORKING/` to regenerate metrics from trained artifacts.*
+
+### DeepfakeBench Backend (DFDC Fine-Tuned)
+
+| Metric | Xception Zero-Shot | Xception + DFDC FT | Image + rPPG Fusion |
+| --- | ---: | ---: | ---: |
+| AUC-ROC | 0.6072 | 0.9715 | 0.9707 |
+| Balanced Accuracy | 0.6081 | 0.9057 | **0.9083** |
+| EER | 0.4026 | 0.0937 | **0.0937** |
+| ECE | 0.0726 | 0.1071 | **0.0302** |
+| Brier | 0.2434 | 0.0806 | **0.0686** |
+
+For reference, the strongest classical baseline on the exact same split and the
+59 fused features is RandomForest: AUC 0.8693, balanced accuracy 0.7758, EER
+0.2134. Test split: 544 videos (298 real / 246 fake). Thresholds are selected on
+the 546-video validation split only. UCF and EfficientNet-B4 were evaluated
+zero-shot (test AUC 0.5383 and 0.5491 respectively); see
+[`Docs/dfb_report.md`](Docs/dfb_report.md) for the full methodology and ablations.
+
+ViT metrics are intentionally not listed until a DFDC run is completed locally.
+`python -m vit.pipeline --all` writes `MAJ_OUTPUT_ROOT/vit/metrics_vit.json`,
+`metrics_vit_only.json`, and `comparison.md`; the comparison table also includes
+the existing VQC and best classical rows when their metrics files are present.
 
 ## Components
 
@@ -177,6 +212,95 @@ python -m quantum.pipeline --all
 python -m quantum.tests
 ```
 
+### 5. ViT Alternative Backend (`WORKING/vit/`)
+
+A timm pretrained ViT is an alternative decision stage. It consumes
+`frames_per_video` accepted face frames per video (default 16; cropped faces are
+preferred when present, otherwise the stage-1 accepted frames are used), encodes
+each frame, aggregates the frame embeddings with an attention-pooled or small
+Transformer temporal head, and optionally fuses the 20 rPPG features through a
+small MLP.
+
+- **Backbones** — `vit_small_patch16_224.augreg_in21k_ft_in1k` (default),
+  `vit_base_patch16_224`, `deit_small_patch16_224`, `swin_tiny_patch4_window7_224`.
+- **Temporal heads** — `attention_pool` (default), `transformer`, `mean_logits`
+  (ViT-only; requires rPPG fusion to be disabled).
+- **Two-stage training** — Stage A freezes the backbone and trains the temporal +
+  fusion heads; Stage B unfreezes the last 4 blocks with layer-wise LR decay.
+  Uses AdamW, mixed precision, gradient clipping, balanced sampling/positive
+  weighting, and early stopping on validation AUC.
+- **Calibration** — one scalar temperature and the decision threshold are fitted
+  on validation videos only, then applied unchanged to the test split.
+- **Evaluation** — video-level accuracy, balanced accuracy, precision, recall,
+  F1, specificity, AUC-ROC, ECE, ROC/confusion/calibration plots, and a
+  VQC/classical/ViT comparison table.
+- **Splits** — reuses `MAJ_OUTPUT_ROOT/quantum/split_manifest_fused.json`, so the
+  ViT and VQC use identical video/group splits. Optional 5-fold grouped CV keeps
+  every video/group in exactly one fold.
+
+```bash
+# From WORKING/ - requires frames, rPPG CSV, and the fused split manifest
+python -m vit.pipeline --train
+python -m vit.pipeline --evaluate
+python -m vit.pipeline --all            # fused ViT + ViT-only (mean logits) + comparison
+python -m vit.pipeline --cross-validate # grouped 5-fold CV
+python -m vit.tests                     # self-checks (no dataset required)
+python -m pytest -q ..\tests\vit        # tracked pytest entry points
+
+# Deterministic smoke subset (still requires real aligned data)
+python -m vit.pipeline --all --max-videos 50
+```
+
+Checkpoints are `state_dict` files with a sidecar JSON config and are loaded with
+`weights_only=True`; no pickle is introduced. A missing checkpoint or less than
+`frames_per_video` accepted frames yields `INCONCLUSIVE` (exit code 3), never a
+fabricated probability.
+
+### 6. DeepfakeBench Alternative Backend (`WORKING/dfb_backend/`)
+
+A real image-based detector from DeepfakeBench replaces the VQC decision stage.
+The wrapper imports the upstream Xception, UCF, or EfficientNet-B4 detector,
+its YAML preprocessing config, and the FF++ checkpoint, then reproduces the DFB
+test transform on the Stage-1 accepted frames (RGB, `INTER_CUBIC`, /255,
+0.5/0.5/0.5 normalization). Sixteen frames per video are scored and aggregated
+to a video-level `P(real)`.
+
+- **Checkpoints** — `xception_best.pth`, `ucf_best.pth`, `effnb4_best.pth`
+  from `WORKING/third_party/DeepfakeBench/training/weights/`; all load strictly.
+- **DFDC fine-tuning** — optional Xception fine-tune (6 epochs, AdamW, AMP,
+  frozen backbone for epoch 1, balanced sampling); best checkpoint saved as
+  `MAJ_OUTPUT_ROOT/dfb/xception_finetuned.pt` with a JSON sidecar.
+- **Fusion** — image logit + 20 rPPG features through balanced logistic
+  regression; temperature and `C` are fitted on validation only. The deployed
+  REAL cutoff is selected conservatively on validation data to cap fake-video
+  false acceptance at 1%, rather than using a balanced Youden cutoff that can
+  be unsafe for KYC.
+- **Inference** — uses the fine-tuned checkpoint when present, falling back to
+  the upstream zero-shot checkpoint otherwise. Deployment scores 32 evenly
+  distributed accepted frames and uses the highest-scoring 25% (`topk`)
+  instead of averaging away short deepfake evidence. rPPG fusion is supporting
+  evidence only and cannot increase the visual DFB REAL probability. Too few
+  frames yields `INCONCLUSIVE` (exit code 3), never a fabricated probability.
+- **Security** — project-owned checkpoints and fusion artifacts are plain
+  state dictionaries/JSON loaded with `weights_only=True`; upstream detector
+  constructors load pretrained backbones with `weights_only=False` (upstream
+  behavior, trusted checkpoints only).
+
+```powershell
+# From WORKING/
+python -m dfb_backend.tests
+python -m dfb_backend.evaluation --zero-shot --detectors xception ucf efficientnetb4
+python -m dfb_backend.evaluation --finetune --detectors xception --epochs 6
+python -m dfb_backend.evaluation --fuse --detector xception --mode finetuned
+python run_pipeline.py --backend dfb --source path\to\video.mp4 --detector xception
+```
+
+DeepfakeBench is CC BY-NC 4.0 (non-commercial). See
+[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) and
+[`Docs/dfb_report.md`](Docs/dfb_report.md). The upstream clone is pinned at
+`f188b1c105465e2e5377eb536a95022ae0e4522d`; see
+`WORKING/third_party/DeepfakeBench.commit`.
+
 ## Install
 
 ```bash
@@ -189,6 +313,14 @@ pip install torchvision scikit-image
 # Stage 4 (quantum) - PennyLane, PyTorch, scikit-learn, scipy, matplotlib
 pip install pennylane torch numpy scikit-learn scipy matplotlib
 
+# Stage 4B (ViT) - timm (uses the installed PyTorch)
+pip install timm
+
+# Stage 4C (DeepfakeBench) - clone the pinned upstream repo, then install extras
+git clone https://github.com/SCLBD/DeepfakeBench.git WORKING/third_party/DeepfakeBench
+git -C WORKING/third_party/DeepfakeBench checkout f188b1c105465e2e5377eb536a95022ae0e4522d
+pip install -r requirements-dfb.txt
+
 # Frontend (optional)
 cd frontend && npm install
 ```
@@ -198,7 +330,12 @@ cd frontend && npm install
 ```bash
 # From WORKING/
 python run_pipeline.py --source path/to/video.mp4 --method POS --out result.json
+python run_pipeline.py --backend vit --source path/to/video.mp4 --out vit_result.json
+python run_pipeline.py --backend dfb --source path/to/video.mp4 --detector xception --out dfb_result.json
 ```
+
+The ViT backend requires `MAJ_OUTPUT_ROOT/vit/vit_model.pt` and its sidecar
+`vit_model.json` (created by `python -m vit.pipeline --train` or `--all`).
 
 Requires pre-trained quantum artifacts for **fused mode** (`MAJ_OUTPUT_ROOT/quantum/qaoa_selection_fused.json`, `hybrid_vqc_fused.pt`, `feature_scaler_fused.json`). If missing, run once from `WORKING/`:
 
@@ -219,14 +356,14 @@ python server.py          # Backend API on http://127.0.0.1:8000
 npm run dev               # React dev server on http://localhost:5173 (proxies /api)
 ```
 
-Upload a KYC video, watch the three-stage pipeline run live via SSE,
+Upload a KYC video, watch the pipeline run live via SSE,
 and read the verdict with its evidence dossier (accepted frames, physiological
-features, quantum probabilities and plots, the pulse waveform).
+features, backend probabilities and plots, the pulse waveform).
 
 ### API Contract (`frontend/server.py`)
 
 ```text
-POST /api/detect              upload video (raw body + X-Filename header) → {job: <id>}
+POST /api/detect              upload video (raw body + X-Filename + X-Backend: quantum|vit|dfb) → {job: <id>}
 GET  /api/jobs/<id>           {done, error, video, signal, lines[-400:], result}
 GET  /api/jobs/<id>/events    SSE: line / stage / result / signal / error
 GET  /api/previous            last canonical pipeline result (with _signal)
@@ -257,7 +394,7 @@ Theme toggle persists `rppgqc.theme` in localStorage; respects `prefers-reduced-
 > **Feature contract:** `FUSED_FEATURE_NAMES` in `quantum/config.py` (59 features = 20 rPPG + 39 visual) must stay identical in name AND order to `RPPGFeatures.feature_names()` + `VISUAL_FEATURE_NAMES`. Keep the two lists in sync; `test_feature_contract_sync` guards it.
 
 - **Only fused mode supported.** No `rppg_only`, `visual_only`, `rppg_base`, `rppg_cross_roi`, or ablation feature sets.
-- **Only DFDC dataset supported.** No FaceForensics++ (FF++). `DFDC_DATASET_PATH` env var must point to `archive/DFDC_Dataset`.
+- **Only DFDC is used for training/evaluation data.** No FF++ videos or annotations are added. The DeepfakeBench backend may initialize from the published FF++ checkpoints; they are pretrained weights, not project training data. `DFDC_DATASET_PATH` must point to `archive/DFDC_Dataset`.
 - **Label conventions differ per stage — do not unify:**
   - rPPG CSV: `1 = fake, 0 = real`
   - quantum: `LABEL_REAL = 1`, `LABEL_FAKE = 0`; `quantum/data.py` flips via the tested `csv_to_quantum_label()` (`y = 1 - csv_label` lives only inside that function)
@@ -265,7 +402,7 @@ Theme toggle persists `rppgqc.theme` in localStorage; respects `prefers-reduced-
 - **Gitignored artifacts:** `*.csv`, `*.json`, `*.pkl`, `*.mp4`, and all `MAJ_OUTPUT_ROOT` dirs are untracked — `dataset_features.csv`, `MAJ_OUTPUT_ROOT/visual/fused_features.csv`, `MAJ_OUTPUT_ROOT/quantum/*`, and the trained models will not appear in `git status`. Regenerating them is normal.
 - **rPPG returns `features=None`** when usable frames < `min_usable_frames` (24); `run_pipeline.py` then emits an **INCONCLUSIVE** verdict (confidence `null`) and exits **3** per the AGENTS.md contract. New code must handle `None` and exit code 3.
 - **Stage 1 feeds stage 2 & 3.** `run_pipeline.py` hands the frame stage's accepted JPEGs (`MAJ_OUTPUT_ROOT/frames/frame_sequences/<video>/frames/`) plus `frame_metadata.jsonl` to `RPPGPipeline.process_frames()` at the stage-1 sample rate (30 fps) and to `visual.extractor.compute_visual_features()` for face crops. rPPG no longer re-gates on blur/brightness (stage 1 did) but still runs MediaPipe per frame; `features=None` handling emits INCONCLUSIVE and exits 3 (same contract as above). If stage 1 fails or yields no frames, `run_pipeline.py` falls back to `RPPGPipeline.process_video()` (direct video read; `input_mode` in the result JSON records which path ran). Standalone RPPG scripts keep using `process_video`. `run_pipeline.py --signal-out <path>` writes the decimated stage-2 waveform JSON (same schema as the retired standalone `frontend/dump_signal.py`).
-- **RandomForest cross-check** is an optional side path; the final verdict comes exclusively from the quantum stage.
+- **RandomForest cross-check** is an optional side path; the final verdict comes from the selected backend (`quantum` by default, `vit` with `--backend vit`, or `dfb` with `--backend dfb`).
 - **rPPG classifier trust:** `MAJ_OUTPUT_ROOT/rppg/` must remain write-protected; `rppg_classifier.pkl` is `pickle.load`-ed by `run_pipeline.py` (arbitrary-code risk if replaced). Never move to shared hosting as-is.
 - **QAOA selection weights:** the selection objective uses supervised discrimination weights (`qaoa._discrimination_weights`: sign-agnostic exact Mann-Whitney AUC strength `2*|AUC-0.5|`, deterministic, no sklearn). `QAOASelectionConfig.target_features` is 3. Keep `_mutual_info_weights` only as a documented alternative — do not reintroduce it into `select()`.
 - **QAOA ansatz:** `_apply_qaoa` applies precomputed cost gates with `gamma` and X-mixer gates with `beta` separately. Regression guard: `test_beta_alive` in `quantum/tests.py`. Any refactor must keep beta alive and re-run `python -m quantum.tests` + `--all`.
@@ -279,6 +416,9 @@ Theme toggle persists `rppgqc.theme` in localStorage; respects `prefers-reduced-
 - `Docs/maj_proj_report_sem_6/research_paper/` — 23+ research papers on deepfake detection, QML, and rPPG
 - `Docs/charts/` — 5 performance comparison charts
 - `Docs/QML/M1-M5.pdf` — 5 Quantum Machine Learning module PDFs
+- `Docs/vit_report.md` — ViT backend architecture, training, artifacts, and evidence status
+- `Docs/dfb_report.md` — DeepfakeBench backend, DFDC fine-tuning, fusion, and ablations
+- `THIRD_PARTY_NOTICES.md` — DeepfakeBench attribution and CC BY-NC 4.0 notice
 - `changes.md` — historical development log (Phases 1–10, superseded)
 
 ## Team
@@ -288,3 +428,4 @@ Theme toggle persists `rppgqc.theme` in localStorage; respects `prefers-reduced-
 | **Jhashank** | rPPG-to-classifier pipeline, quantum model (Stage 3)               |
 | **Sumit**    | Input-to-ROI pipeline (data, frames, face detection) (Stage 1)     |
 | **Aswin**    | Preprocessing policy, evaluation, integration (Stage 2)            |
+# pretrained-mode--deepfake-model
